@@ -1,5 +1,7 @@
 import numpy as np
 import astropy.units as u
+import struct
+
 from astropy.utils import lazyproperty
 
 from ..vlbi_base.base import (VLBIFileBase, VLBIStreamReaderBase,
@@ -45,7 +47,7 @@ class Mark5BFileReader(VLBIFileBase):
                                     kday=kday, ref_time=ref_time)
 
     def find_header(self, template_header=None, framesize=None, kday=None,
-                    maximum=None, forward=True):
+                    maximum=None, forward=True, syncword=None):
         """Look for the first occurrence of a frame.
 
         Search is from the current position.  If given, a template_header
@@ -57,8 +59,8 @@ class Mark5BFileReader(VLBIFileBase):
             Template Mark 5B header, from which `kday` and `framesize`
             are extracted.
         framesize : int, optional
-            Size of a frame, in bytes.  Required if `template_header` is
-            ``None``.
+            Size of a frame, in bytes.  Used if `template_header` is
+            ``None``.  Default is 10016.
         kday : int, optional
             Explicit thousands of MJD of the observation time, used to infer
             the full MJD.  If `template_header` and `kday` are both ``None``,
@@ -68,18 +70,30 @@ class Mark5BFileReader(VLBIFileBase):
             framesize.
         forward : bool, optional
             Seek forward if ``True`` (default), backward if ``False``.
+        syncword: int or bytestring, optional
+            The syncword to search for in the Mark 5B header
+            Default is the default syncword, 0xABADDEED
 
         Returns
         -------
         header : :class:`~baseband.mark5b.Mark5BHeader`, or None
             Retrieved Mark 5B header, or ``None`` if nothing found.
-        """
+            """
+
         fh = self.fh_raw
+
+        if syncword is None:
+            syncword  = Mark5BHeader._header_parser.defaults['sync_pattern']
+        if type(syncword) is not bytes:
+            bsync = struct.Struct('<1I').pack(syncword)
         if template_header:
             kday = template_header.kday
             framesize = template_header.framesize
+        if framesize is None:
+            framesize = Mark5BHeader.size.fget(Mark5BHeader)+Mark5BHeader.payloadsize.fget(Mark5BHeader)
         if maximum is None:
             maximum = 2 * framesize
+
         # Loop over chunks to try to find the frame marker.
         file_pos = fh.tell()
         # First check whether we are right at a frame marker (usually true).
@@ -90,18 +104,23 @@ class Mark5BFileReader(VLBIFileBase):
         except AssertionError:
             pass
 
-        fh.seek(0, 2)
-        size = fh.tell()
+        size = fh.seek(0,2) 
         if forward:
-            iterate = range(file_pos, min(file_pos + maximum - 16,
-                                          size - framesize))
+            iterate = range(file_pos, min(file_pos + maximum - 2*framesize,
+                                          size - 2*framesize),framesize)
         else:
-            iterate = range(min(file_pos, size - framesize),
-                            max(file_pos - maximum, -1), -1)
+            iterate = range(file_pos - framesize*2,
+                            max(file_pos - maximum, -1), -framesize)
 
-        for frame in iterate:
+        for block_start in iterate:
+            fh.seek(block_start)
+            block = fh.read(min(framesize*2,size-block_start))
             try:
+                frame = block.index(bsync) + block_start
                 fh.seek(frame)
+            except ValueError:
+                continue
+            try:
                 header1 = Mark5BHeader.fromfile(fh, kday=kday, verify=True)
             except AssertionError:
                 continue
